@@ -15,7 +15,12 @@
       0x0feff	is the byte order mark --> Big Endian
       0x0fffe	wrong order --> Little Endia
       
-      
+    
+    Separation chars:
+      ; , : tab
+    Text might be included in double quotes
+    Double quote inside double quote are two double quotes
+    
 */
 
 #include <stdio.h>
