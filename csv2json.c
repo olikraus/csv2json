@@ -33,15 +33,27 @@
 #define FT_UTF16_LE 4		/* low byte first */
 #define FT_WIN1252 5		
 
+
+#define ERR_NONE 0
+#define ERR_UTF 1
+#define ERR_CSV 2
+
 /*=================================================*/
 
 const char *input_name;
 FILE *input_fp = NULL;
+int err_code = ERR_NONE;		/* one of ERR_NONE, ERR_UTF or ERR_CSV */
 
 /*=================================================*/
 void msg(const char *msg)
 {
   puts(msg);
+}
+
+void err(int code, const char *msg)
+{
+  err_code = code;
+  printf("Err %d: %s", code, msg);
 }
 
 /*=================================================*/
@@ -94,7 +106,7 @@ int get_file_type(void)
     total_cnt++;
     if ( first == 0 )
       even_zero_cnt++;
-    second = getc(input_fp);
+    second = getc(input_fp); 
     if ( second == EOF )
       break;    
     total_cnt++;
@@ -138,9 +150,14 @@ int get_file_type(void)
   return FT_UTF8;  
 }
 
-void outfn_null(long x)
+/*=================================================*/
+
+int outfn_null(long x)
 {
+	return 1;
 }
+
+/*=================================================*/
 
 long sep_curr[64];
 long sep_min[64];
@@ -158,12 +175,12 @@ void clear_csv_structure(void)
   }
 }
 
-void outfn_detect_csv_structure(long x)
+int outfn_detect_csv_structure(long x)
 {
     if ( last_char == '\n' && x == '\r' )
-      return;
+      return 1;
     if ( last_char == '\r' && x == '\n' )
-      return;
+      return 1;
     if ( x == '\r' || x == '\n' )
     {
       int i;
@@ -178,10 +195,241 @@ void outfn_detect_csv_structure(long x)
     }
     if ( x < 64 )
       sep_curr[x]++;
+    last_char = x;
+    return 1;
 }
 
+/*=================================================*/
 
-int read_utf8(  void (*outfn)(long) )
+long csv_sep = ';';
+long csv_quote = '\"';
+long csv_last_char = -1;
+long csv_line_number = 1;
+long csv_prev_field_cnt = -1;
+long csv_field_cnt = 0;
+
+int is_inside_field = 0;
+int is_inside_quote = 0;
+int is_escape = 0;
+
+
+/*=================================================*/
+/* CSV output functions */
+
+void csv_field_start(void)
+{
+	printf("[");
+}
+
+void csv_field_char(long c)
+{
+	if ( c == csv_quote )
+	{
+		printf("\\%c", (int)c);		
+	}
+	else if ( c >= ' ' && c < 128 )
+	{
+		printf("%c", (int)c);
+	}
+	else if ( c <= 0x0ffff )  /* unicode is in BMP */
+	{
+		printf("\\u%04x", (unsigned)c);
+	}
+	else /* unicode is not in BMP */
+	{
+		/* char is outside Basic Multilingual Plane*/
+		/* we need to output as UTF-16 code pair */
+		/* TODO */
+	}
+}
+
+void cvs_field_end(void)
+{
+	printf("]");
+	csv_field_cnt++;
+}
+
+void csv_line_start()
+{
+}
+
+void csv_line_end()
+{
+	printf("\n");
+}
+
+/*=================================================*/
+
+void csv_parser_init(int sep)
+{
+	csv_sep = sep;
+	csv_last_char = -1;
+	csv_line_number = 1;
+	csv_last_char = -1;
+	is_inside_field = 0;
+	is_inside_quote = 0;
+	is_escape = 0;
+}
+
+int csv_parser_outfn(long c)
+{
+	/* do the cr/lf handling only if we are outside quotes */
+	if ( is_inside_quote == 0 || (is_inside_quote != 0 && is_escape != 0 ) )
+	{
+		if ( last_char == '\n' && c == '\r' )
+			return 1;
+		if ( last_char == '\r' && c == '\n' )
+			return 1;
+		if ( c == '\r' || c == '\n' )
+		{
+			if ( is_escape )
+			{
+				/* quote found, but followed by a line break */
+				is_inside_quote = 0;
+				is_escape = 0;
+				/* the is_inside_field will be handled in the next state */
+			}
+			if ( is_inside_field != 0 )
+			{
+				cvs_field_end();
+				is_inside_field = 0;
+			}
+			if ( csv_prev_field_cnt < 0 )
+			{
+				csv_prev_field_cnt = csv_field_cnt;
+			}
+			else
+			{
+				if ( csv_prev_field_cnt != csv_field_cnt )
+				{
+					err(ERR_UTF, "CSV parser: Number of fields not constant");
+					return 0;		/* number of fields does not match */
+				}
+			}
+
+			csv_line_end();
+			csv_line_number++;
+			
+			is_escape = 0;
+			csv_field_cnt = 0;
+			
+			/* stop here, the line break has been handled correctly */
+			return 1;
+		}
+	}
+	
+	if ( is_inside_field == 0 && is_inside_quote == 0 )
+	{
+		if ( c == csv_sep )
+		{
+			/* found a csv_sep, could be the starting position of a new line */
+			/* --> generate an empty field */
+			csv_field_start();
+			cvs_field_end();
+		}
+		else if ( c == csv_quote )
+		{
+			/* found a quote, so a quoted field starts */
+			csv_field_start();
+			is_inside_field = 1;
+			is_inside_quote = 1;
+		}
+		else
+		{
+			/* found an unquoted field */
+			csv_field_start();
+			is_inside_field = 1;
+			csv_field_char(c);
+		}
+	}
+	else if ( is_inside_field == 0 && is_inside_quote == 1 )
+	{
+		/* illegal, this should not be possible */
+		err(ERR_UTF, "CSV parser: Internal error");
+		return 0;
+	}
+	else if ( is_inside_field == 1 && is_inside_quote == 0 )
+	{
+		/* inside unquoted field */
+		if ( c == csv_sep )
+		{
+			/* end of field detected */
+			cvs_field_end();
+			is_inside_field = 0;			
+		}
+		else if ( c == csv_quote )
+		{
+			/* i think this case has to be handled just like the last case */
+			csv_field_char(c);			
+		}
+		else
+		{
+			csv_field_char(c);			
+		}
+	}
+	else if ( is_inside_field == 1 && is_inside_quote == 1 && is_escape == 0 )
+	{
+		/* inside a quoted field */
+		if ( c == csv_sep )
+		{
+			/* separator char is just a data here */
+			csv_field_char(c);			
+		}
+		else if ( c == csv_quote )
+		{
+			/* quote could be the end of the field or the escape sign */
+			/* this will be handled in the escape case */
+			is_escape = 1;
+		}
+		else
+		{
+			/* just output the data */
+			csv_field_char(c);			
+		}
+	}
+	else if ( is_inside_field == 1 && is_inside_quote == 1 && is_escape == 1 )
+	{
+		/* escape sequence inside a quoted field */
+		if ( c == csv_sep )
+		{
+			/* the quote char is followed by separator char */
+			/* this denotes the end of the quoted field. */
+			cvs_field_end();
+			is_inside_field = 0;
+			is_inside_quote = 0;
+			is_escape = 0;
+		}
+		else if ( c == csv_quote )
+		{
+			/* quote is followed by quote: send the quote itself and close the escape sequence*/
+			csv_field_char(c);
+			is_escape = 0;
+		}
+		else
+		{
+			/* quote is followed by something else, not sure what todo... might be an error... */
+			/* we just output the char for now and close the escape */
+			csv_field_char(c);
+			is_escape = 0;
+		}
+	}
+	
+	csv_last_char = c;
+	return 1;
+}
+
+void csv_parser_end(void)
+{
+	if ( is_inside_field != 0 )
+	{
+		cvs_field_end();
+	}
+	
+}
+
+/*=================================================*/
+
+int read_utf8(  int (*outfn)(long) )
 {
   int c;
   long unicode;
@@ -199,11 +447,12 @@ int read_utf8(  void (*outfn)(long) )
     else if ( c < 128 )
     {
       unicode = c;
-      outfn(unicode);
+      if ( outfn(unicode) == 0 )
+	      return 0;
     }
     else if ( c >= 0x080 && c < 0x0c0 )
     {
-      msg("UTF-8 reader failed with illegal start byte: Not UTF-8.");
+      err(ERR_UTF, "UTF-8 reader failed with illegal start byte: Not UTF-8.");
       return 0;
     }
     /* two byte sequence */
@@ -214,20 +463,22 @@ int read_utf8(  void (*outfn)(long) )
       c = getc(input_fp);
       if ( c == EOF )
       {
-	msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	return 0;	
       }
       else if ( c < 0x080 || c >= 0x0c0 )
       {
-	msg("UTF-8 reader failed with illegal second byte: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader failed with illegal second byte: Not UTF-8.");
 	return 0;		
       }
       else
       {
+	
 	c &= 0x03f;
 	unicode <<= 6;
 	unicode |= c;
-	outfn(unicode);
+	if ( outfn(unicode) == 0 )
+	      return 0;
       }
     }
     /* three byte sequence */
@@ -238,12 +489,12 @@ int read_utf8(  void (*outfn)(long) )
       c = getc(input_fp);
       if ( c == EOF )
       {
-	msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	return 0;	
       }
       else if ( c < 0x080 || c >= 0x0c0 )
       {
-	msg("UTF-8 reader failed with illegal second byte: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader failed with illegal second byte: Not UTF-8.");
 	return 0;		
       }
       else
@@ -254,12 +505,12 @@ int read_utf8(  void (*outfn)(long) )
 	c = getc(input_fp);
 	if ( c == EOF )
 	{
-	  msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	  err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	  return 0;	
 	}
 	else if ( c < 0x080 || c >= 0x0c0 )
 	{
-	  msg("UTF-8 reader failed with illegal third byte: Not UTF-8.");
+	  err(ERR_UTF, "UTF-8 reader failed with illegal third byte: Not UTF-8.");
 	  return 0;		
 	}
 	else
@@ -267,7 +518,8 @@ int read_utf8(  void (*outfn)(long) )
 	  c &= 0x03f;
 	  unicode <<= 6;
 	  unicode |= c;
-	  outfn(unicode);
+  	  if ( outfn(unicode) == 0 )
+	      return 0;
 	}
       }
     }
@@ -279,12 +531,12 @@ int read_utf8(  void (*outfn)(long) )
       c = getc(input_fp);
       if ( c == EOF )
       {
-	msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	return 0;	
       }
       else if ( c < 0x080 || c >= 0x0c0 )
       {
-	msg("UTF-8 reader failed with illegal second byte: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader failed with illegal second byte: Not UTF-8.");
 	return 0;		
       }
       else
@@ -295,12 +547,12 @@ int read_utf8(  void (*outfn)(long) )
 	c = getc(input_fp);
 	if ( c == EOF )
 	{
-	  msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	  err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	  return 0;	
 	}
 	else if ( c < 0x080 || c >= 0x0c0 )
 	{
-	  msg("UTF-8 reader failed with illegal third byte: Not UTF-8.");
+	  err(ERR_UTF, "UTF-8 reader failed with illegal third byte: Not UTF-8.");
 	  return 0;		
 	}
 	else
@@ -311,12 +563,12 @@ int read_utf8(  void (*outfn)(long) )
 	  c = getc(input_fp);
 	  if ( c == EOF )
 	  {
-	    msg("UTF-8 reader unexpected EOF: Not UTF-8.");
+	    err(ERR_UTF, "UTF-8 reader unexpected EOF: Not UTF-8.");
 	    return 0;	
 	  }
 	  else if ( c < 0x080 || c >= 0x0c0 )
 	  {
-	    msg("UTF-8 reader failed with illegal fourth byte: Not UTF-8.");
+	    err(ERR_UTF, "UTF-8 reader failed with illegal fourth byte: Not UTF-8.");
 	    return 0;		
 	  }
 	  else
@@ -324,14 +576,16 @@ int read_utf8(  void (*outfn)(long) )
 	    c &= 0x03f;
 	    unicode <<= 6;
 	    unicode |= c;
-	    outfn(unicode);
+ 	    if ( outfn(unicode) == 0 )
+	      return 0;
 	  }
 	}
       }
     }
     else
     {
-	msg("UTF-8 reader failed with illegal first byte: Not UTF-8.");
+	err(ERR_UTF, "UTF-8 reader failed with illegal first byte: Not UTF-8.");
+	return 0;
     }
   }
   return 1;
@@ -364,9 +618,13 @@ int main(int argc, char **argv)
     }
   }
   
-  get_file_type();
-  clear_csv_structure();
-  read_utf8(  outfn_detect_csv_structure );
+  //get_file_type();
+  //clear_csv_structure();
+  
+  // input file --> utf8 reader --> csv parser --> outputs to stdout
+  csv_parser_init(';');
+  read_utf8(  csv_parser_outfn );
+  csv_parser_end();
   
   return 0;
 }
